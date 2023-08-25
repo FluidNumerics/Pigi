@@ -2,6 +2,7 @@
 
 #include <array>
 #include <algorithm>
+#include <mutex>
 #include <type_traits>
 #include <vector>
 
@@ -9,6 +10,10 @@
 #include <hip/hip_runtime.h>
 
 #include "hip.h"
+
+// This mutex serializes calls to hipMallocAsync() and hipFreeAsync()
+// to avoid a deadlock bug occurring in hip v5.2.3
+std::mutex memlock;
 
 enum class MemoryStorage { Host, Device };
 
@@ -50,13 +55,17 @@ void malloc(HostPointer<T>& ptr, size_t sz) {
 
 template <typename T>
 void malloc(DevicePointer<T>& ptr, size_t sz) {
-    HIPCHECK( hipMallocAsync(&ptr, sz, hipStreamPerThread) ); }
+    std::lock_guard lock(memlock);
+    HIPCHECK( hipMallocAsync(&ptr, sz, hipStreamPerThread) );
+    HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
+}
 
 template <typename T>
 void memcpy(HostPointer<T> dst, HostPointer<T> src, size_t sz) {
     HIPCHECK(
         hipMemcpyAsync(dst, src, sz, hipMemcpyHostToHost, hipStreamPerThread)
     );
+    HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
 }
 
 template <typename T>
@@ -64,6 +73,7 @@ void memcpy(HostPointer<T> dst, DevicePointer<T> src, size_t sz) {
     HIPCHECK(
         hipMemcpyAsync(dst, src, sz, hipMemcpyDeviceToHost, hipStreamPerThread)
     );
+    HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
 }
 
 template <typename T>
@@ -71,6 +81,7 @@ void memcpy(DevicePointer<T> dst, HostPointer<T> src, size_t sz) {
     HIPCHECK(
         hipMemcpyAsync(dst, src, sz, hipMemcpyHostToDevice, hipStreamPerThread)
     );
+    HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
 }
 
 template <typename T>
@@ -78,6 +89,7 @@ void memcpy(DevicePointer<T> dst, DevicePointer<T> src, size_t sz) {
     HIPCHECK(
         hipMemcpyAsync(dst, src, sz, hipMemcpyDeviceToDevice, hipStreamPerThread)
     );
+    HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
 }
 
 template <typename T, int N, typename Pointer>
@@ -94,7 +106,6 @@ public:
     NDBase& operator=(const NDBase& other) {
         shapecheck(*this, other);
         memcpy(this->ptr, other.ptr, this->size() * sizeof(T));
-        HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
         return (*this);
     }
 
@@ -103,7 +114,6 @@ public:
     NDBase& operator=(const NDBase<T, N, S>& other) {
         shapecheck(*this, other);
         memcpy(this->ptr, other.ptr, this->size() * sizeof(T));
-        HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
         return (*this);
     }
 
@@ -142,6 +152,7 @@ public:
         HIPCHECK(
             hipMemsetAsync(this->ptr, 0, this->size() * sizeof(T), hipStreamPerThread)
         );
+        HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
     }
 
     void fill(const T& val) requires(std::is_same<HostPointer<T>, Pointer>::value) {
@@ -210,7 +221,6 @@ public:
     explicit Array(const std::array<long long, N> dims) : NDBase<T, N, Pointer>(dims) {
         malloc(this->ptr, this->size() * sizeof(T));
         this->zero();
-        HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
     }
 
     // Explicit copy constructor
@@ -243,6 +253,7 @@ public:
     // Destructor
     ~Array() {
         if (this->ptr) {
+            std::lock_guard lock(memlock);
             HIPCHECK( hipFreeAsync(this->ptr, hipStreamPerThread) );
             HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
         }

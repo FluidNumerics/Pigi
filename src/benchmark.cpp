@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <numeric>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -10,7 +12,9 @@
 #include <catch2/catch_template_test_macros.hpp>
 #include <fmt/format.h>
 
+#include "degridder.h"
 #include "gridspec.h"
+#include "gridder.h"
 #include "invert.h"
 #include "mset.h"
 #include "memory.h"
@@ -19,6 +23,8 @@
 #include "taper.h"
 #include "uvdatum.h"
 #include "workunit.h"
+
+const char* TESTDATA = getenv("TESTDATA");
 
 template <typename F>
 auto simple_benchmark(std::string_view name, const int N, const F f) {
@@ -31,7 +37,7 @@ auto simple_benchmark(std::string_view name, const int N, const F f) {
         f();
         auto end = std::chrono::steady_clock::now();
         timings.push_back(
-            std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()
+            std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()
         );
     }
 
@@ -51,14 +57,16 @@ auto simple_benchmark(std::string_view name, const int N, const F f) {
     );
 
     fmt::println(
-        "Benchmark: {} ({} samples) mean: {:.3f} +/- {:.3f} s median: {:.3f} s",
-        name, N, mean / 1000, std::sqrt(variance) / 1000, median / 1000
+        "Benchmark: {} ({} samples) mean: {:.6f} +/- {:.6f} s median: {:.6f} s",
+        name, N, mean / 1000000, std::sqrt(variance) / 1000000, median / 1000000
     );
 
     return ret;
 }
 
 TEST_CASE("MSet reading and paritioning", "[io]") {
+    if (!TESTDATA) { SKIP("TESTDATA path not provided"); }
+
     auto gridspec = GridSpec::fromScaleLM(8000, 8000, std::sin(deg2rad(15. / 3600)));
     auto subgridspec = GridSpec::fromScaleUV(96, 96, gridspec.scaleuv);
 
@@ -66,7 +74,7 @@ TEST_CASE("MSet reading and paritioning", "[io]") {
     Aterms.fill({1, 0, 0, 1});
 
     MeasurementSet mset(
-        "/home/torrance/testdata/1215555160/1215555160.ms",
+        TESTDATA,
         {.chanlow = 0, .chanhigh = 191}
     );
 
@@ -84,6 +92,8 @@ TEST_CASE("MSet reading and paritioning", "[io]") {
 }
 
 TEMPLATE_TEST_CASE("Invert", "[invert]", float, double) {
+    if (!TESTDATA) { SKIP("TESTDATA path not provided"); }
+
     auto gridspec = GridSpec::fromScaleLM(8000, 8000, std::sin(deg2rad(15. / 3600)));
     auto subgridspec = GridSpec::fromScaleUV(96, 96, gridspec.scaleuv);
 
@@ -94,8 +104,8 @@ TEMPLATE_TEST_CASE("Invert", "[invert]", float, double) {
     Aterms.fill({1, 0, 0, 1});
 
     MeasurementSet mset(
-        "/home/torrance/testdata/1215555160/1215555160.ms",
-        {.chanlow = 0, .chanhigh = 11}
+        TESTDATA,
+        {.chanlow = 0, .chanhigh = 383}
     );
 
     // Convert to TestType precision
@@ -114,6 +124,8 @@ TEMPLATE_TEST_CASE("Invert", "[invert]", float, double) {
 }
 
 TEMPLATE_TEST_CASE("Predict", "[predict]", float, double) {
+    if (!TESTDATA) { SKIP("TESTDATA path not provided"); }
+
     auto gridspec = GridSpec::fromScaleLM(8000, 8000, std::sin(deg2rad(15. / 3600)));
     auto subgridspec = GridSpec::fromScaleUV(96, 96, gridspec.scaleuv);
 
@@ -124,8 +136,8 @@ TEMPLATE_TEST_CASE("Predict", "[predict]", float, double) {
     Aterms.fill({1, 0, 0, 1});
 
     MeasurementSet mset(
-        "/home/torrance/testdata/1215555160/1215555160.ms",
-        {.chanlow = 0, .chanhigh = 11}
+        TESTDATA,
+        {.chanlow = 0, .chanhigh = 383}
     );
 
     // Convert to TestType precision
@@ -139,10 +151,92 @@ TEMPLATE_TEST_CASE("Predict", "[predict]", float, double) {
     // Create skymap
     HostArray<StokesI<TestType>, 2> skymap({gridspec.Nx, gridspec.Ny});
 
-    simple_benchmark("Predict", 5, [&] {
+    simple_benchmark("Predict", 1, [&] {
         predict<StokesI<TestType>, TestType>(
             workunits, skymap, gridspec, taper, subtaper, DegridOp::Replace
         );
+        return true;
+    });
+}
+
+TEMPLATE_TEST_CASE("gpudift kernel", "[gpudift]", float, double) {
+    std::vector<UVDatum<TestType>> uvdata_h;
+
+    std::mt19937 gen(1234);
+    std::uniform_real_distribution<TestType> rand;
+
+    for (size_t i {}; i < 25000; ++i) {
+        TestType u { (rand(gen) - TestType(0.5)) * 100 };
+        TestType v { (rand(gen) - TestType(0.5)) * 100 };
+        TestType w { (rand(gen) - TestType(0.5)) * 100 };
+
+        uvdata_h.push_back(UVDatum<TestType> {
+            0, 0, u, v, w,
+            {rand(gen), rand(gen), rand(gen), rand(gen)},
+            {
+                {rand(gen), rand(gen)}, {rand(gen), rand(gen)},
+                {rand(gen), rand(gen)}, {rand(gen), rand(gen)}
+            }
+        });
+    }
+
+    auto uvdata_d = DeviceArray<UVDatum<TestType>, 1>::fromVector(uvdata_h);
+
+    auto subgridspec = GridSpec::fromScaleLM(96, 96, deg2rad(15. / 3600));
+    UVWOrigin<TestType> origin {0, 0, 0};
+
+    HostArray<ComplexLinearData<TestType>, 2> Aterm_h({subgridspec.Nx, subgridspec.Ny});
+    Aterm_h.fill({1, 0, 0, 1});
+    DeviceArray<ComplexLinearData<TestType>, 2> Aterm_d(Aterm_h);
+
+    DeviceArray<StokesI<TestType>, 2> subgrid({subgridspec.Nx, subgridspec.Ny});
+
+    simple_benchmark("gpudift", 10, [&] {
+        for (size_t i {}; i < 25; ++i) {
+            gpudift<StokesI<TestType>, TestType>(
+                subgrid, Aterm_d, Aterm_d, origin, uvdata_d, subgridspec, false
+            );
+        }
+        HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
+        return true;
+    });
+}
+
+TEMPLATE_TEST_CASE("gpudft kernel", "[gpudft]", float, double) {
+    std::vector<UVDatum<TestType>> uvdata_h;
+
+    std::mt19937 gen(1234);
+    std::uniform_real_distribution<TestType> rand;
+
+    for (size_t i {}; i < 25000; ++i) {
+        TestType u { (rand(gen) - TestType(0.5)) * 100 };
+        TestType v { (rand(gen) - TestType(0.5)) * 100 };
+        TestType w { (rand(gen) - TestType(0.5)) * 100 };
+
+        uvdata_h.push_back(UVDatum<TestType> {
+            0, 0, u, v, w,
+            {rand(gen), rand(gen), rand(gen), rand(gen)},
+            {
+                {rand(gen), rand(gen)}, {rand(gen), rand(gen)},
+                {rand(gen), rand(gen)}, {rand(gen), rand(gen)}
+            }
+        });
+    }
+
+    auto uvdata_d = DeviceArray<UVDatum<TestType>, 1>::fromVector(uvdata_h);
+
+    auto subgridspec = GridSpec::fromScaleLM(96, 96, deg2rad(15. / 3600));
+    UVWOrigin<TestType> origin {0, 0, 0};
+
+    DeviceArray<ComplexLinearData<TestType>, 2> subgrid({subgridspec.Nx, subgridspec.Ny});
+
+    simple_benchmark("gpudft", 10, [&] {
+        for (size_t i {}; i < 25; ++i) {
+            gpudft<TestType>(
+                uvdata_d, origin, subgrid, subgridspec, DegridOp::Replace
+            );
+        }
+        HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
         return true;
     });
 }

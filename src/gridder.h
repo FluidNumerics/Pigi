@@ -167,9 +167,6 @@ void gridder(
     for (const auto workunit : workunits) { workunitsChannel.push(workunit); }
     workunitsChannel.close();
 
-    // Ensure all stream operators are complete before spanwing new streams
-    HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
-
     std::vector<std::thread> threads;
     for (
         size_t i {};
@@ -177,11 +174,11 @@ void gridder(
         ++i
     ) {
         threads.emplace_back([&] {
-            // Make FFT plan
+            // Make FFT plan for each thread
             auto plan = fftPlan<T>(subgridspec);
 
-            while (auto maybe = workunitsChannel.pop()) {
-                // Get next workunit
+            while (auto  maybe = workunitsChannel.pop()) {
+                // maybe is a std::optional; let's get the value
                 const auto workunit = *maybe;
 
                 const UVWOrigin origin {workunit->u0, workunit->v0, workunit->w0};
@@ -221,11 +218,6 @@ void gridder(
     for (size_t i {}; i < workunits.size(); ++i) {
         const auto [subgrid, workunit] = subgridsChannel.pop().value();
         addsubgrid<T>(grid, subgrid, subgridspec, workunit->u0px, workunit->v0px);
-
-        // I don't think this sync should be necessary, since even if grid goes out of scope
-        // the call to free() should be enqueued in the stream. In any case, it seems to fix
-        // failures.
-        HIPCHECK( hipStreamSynchronize(hipStreamPerThread) );
     }
 
     for (auto& t : threads) { t.join(); }
