@@ -46,20 +46,3 @@ auto getKernelConfig(T fn, int N, size_t sharedMem=0) {
         std::min<int>(nblocksmax, N / nthreads + 1), nthreads
     );
 };
-
-template <typename F, typename T, typename... Ss> __global__
-void mapInto(F f, T out, Ss... ins);
-
-#ifdef __HIPCC__
-template <typename F, typename T, typename... Ss>
-__global__
-void mapInto(F f, T out, Ss... ins) {
-    for (
-        size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        idx < out.size();
-        idx += blockDim.x * gridDim.x
-    ) {
-        out[idx] = f(ins[idx]...);
-    }
-}
-#endif

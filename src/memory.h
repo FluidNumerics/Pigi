@@ -161,18 +161,6 @@ public:
         }
     }
 
-    template <typename F, typename... Ss>
-    void mapInto(F f, Ss... ins) requires(
-        std::is_same<DevicePointer<T>, Pointer>::value
-    ) {
-        // Each input array must have the same dimensions as the output
-        (shapecheck(*this, ins), ...);
-
-        auto fn = ::mapInto<F, NDBase<T, N, Pointer>, Ss...>;
-        auto [nblocks, nthreads] = getKernelConfig(fn, this->size());
-        hipLaunchKernelGGL(fn, nblocks, nthreads, 0, hipStreamPerThread, f, *this, ins...);
-    }
-
     // These friends are required to allow copy assignment between classes with different
     // memory storage locations.
     friend NDBase<T, N, HostPointer<T>>;
@@ -260,15 +248,11 @@ public:
         this->ptr = 0;
     }
 
-    auto asSpan() {
+    operator Span<T, N, Pointer>() {
         return Span<T, N, Pointer> {this->dims, this->ptr};
     }
 
-    auto asSpan() const {
-        return Span<T, N, Pointer> {this->dims, this->ptr};
-    }
-
-    operator Span<T, N, Pointer>() const {
+    operator const Span<T, N, Pointer>() const {
         return Span<T, N, Pointer> {this->dims, this->ptr};
     }
 
